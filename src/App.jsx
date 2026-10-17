@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowRight,
@@ -15,6 +15,9 @@ import {
   ShieldCheck,
   Sparkles,
   Star,
+  Trash2,
+  Upload,
+  Download,
   UserRound,
   UsersRound,
 } from "lucide-react";
@@ -116,6 +119,8 @@ function App() {
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(true);
+  const [isDirty, setIsDirty] = useState(false);
+  const importFileRef = useRef(null);
 
   async function refreshStudents(preferredId) {
     const records = await db.students.orderBy("updatedAt").reverse().toArray();
@@ -125,6 +130,7 @@ function App() {
       if (selected) {
         setCurrentId(selected.id);
         setForm(normalizeStudent(selected));
+        setIsDirty(false);
       }
     }
   }
@@ -155,6 +161,16 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isDirty) return undefined;
+    const warnBeforeExit = (event) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeExit);
+    return () => window.removeEventListener("beforeunload", warnBeforeExit);
+  }, [isDirty]);
+
   const ratedTraits = useMemo(
     () => traits.filter((trait) => form.observations[trait.id]?.rating),
     [form.observations],
@@ -181,19 +197,24 @@ function App() {
         },
       },
     }));
+    setIsDirty(true);
     setNotice("");
   }
 
   function startNewStudent() {
+    if (isDirty && !window.confirm("Perubahan yang belum disimpan akan hilang. Buat profil baru?")) return;
     setCurrentId(null);
     setForm(emptyStudent());
+    setIsDirty(false);
     setNotice("");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function selectStudent(student) {
+    if (isDirty && !window.confirm("Perubahan yang belum disimpan akan hilang. Pindah ke profil ini?")) return;
     setCurrentId(student.id);
     setForm(normalizeStudent(student));
+    setIsDirty(false);
     setNotice("");
   }
 
@@ -220,10 +241,89 @@ function App() {
         id = await db.students.add(record);
       }
       await refreshStudents(id);
+      setIsDirty(false);
       setNotice("Profil tersimpan di perangkat ini.");
     } catch (error) {
       console.error("Gagal menyimpan profil siswa ke IndexedDB.", error);
       setNotice("Profil belum tersimpan. Periksa ruang penyimpanan lalu coba lagi.");
+    }
+  }
+
+  async function deleteStudent() {
+    const selected = students.find((student) => student.id === currentId);
+    if (!selected) return;
+    if (!window.confirm(`Hapus profil ${selected.name}? Data pengamatan pada perangkat ini akan dihapus.`)) return;
+    try {
+      await db.students.delete(currentId);
+      const remaining = await db.students.orderBy("updatedAt").reverse().toArray();
+      setStudents(remaining);
+      setCurrentId(remaining[0]?.id ?? null);
+      setForm(remaining[0] ? normalizeStudent(remaining[0]) : emptyStudent());
+      setIsDirty(false);
+      setNotice("Profil berhasil dihapus dari perangkat ini.");
+    } catch (error) {
+      console.error("Gagal menghapus profil siswa dari IndexedDB.", error);
+      setNotice("Profil belum terhapus. Coba lagi.");
+    }
+  }
+
+  async function exportBackup() {
+    try {
+      const records = await db.students.toArray();
+      const backup = {
+        app: "pendar-karakter-siswa",
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        students: records,
+      };
+      const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `pendar-cadangan-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setNotice(`Cadangan ${records.length} profil berhasil diunduh.`);
+    } catch (error) {
+      console.error("Gagal mengekspor cadangan profil siswa.", error);
+      setNotice("Cadangan belum dapat dibuat. Coba lagi.");
+    }
+  }
+
+  async function importBackup(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (isDirty && !window.confirm("Perubahan yang belum disimpan akan hilang saat memulihkan cadangan. Lanjutkan?")) {
+      event.target.value = "";
+      return;
+    }
+    try {
+      const backup = JSON.parse(await file.text());
+      if (backup?.app !== "pendar-karakter-siswa" || backup?.version !== 1 || !Array.isArray(backup.students)) {
+        throw new Error("Format cadangan tidak dikenali.");
+      }
+      const validStudents = backup.students.filter((student) =>
+        student && typeof student.name === "string" && typeof student.className === "string" && student.observations && typeof student.observations === "object",
+      );
+      if (!validStudents.length) {
+        setNotice("File cadangan tidak berisi profil yang valid.");
+        return;
+      }
+      const imported = validStudents.map((student) => {
+        const { id, ...record } = student;
+        return { ...normalizeStudent(record), updatedAt: record.updatedAt || new Date().toISOString() };
+      });
+      await db.students.bulkAdd(imported);
+      const records = await db.students.orderBy("updatedAt").reverse().toArray();
+      setStudents(records);
+      setCurrentId(records[0].id);
+      setForm(normalizeStudent(records[0]));
+      setIsDirty(false);
+      setNotice(`${imported.length} profil berhasil dipulihkan. Profil yang ada tetap tersimpan.`);
+    } catch (error) {
+      console.error("Gagal mengimpor cadangan profil siswa.", error);
+      setNotice("File tidak dapat dipulihkan. Pastikan file berasal dari Pendar dan belum rusak.");
+    } finally {
+      event.target.value = "";
     }
   }
 
@@ -309,7 +409,7 @@ function App() {
       <main className="main-area">
         <header className="topbar">
           <div className="breadcrumb"><span>Konseling</span><span className="breadcrumb-slash">/</span><strong>Peta karakter</strong></div>
-          <div className="topbar-right"><span className="save-indicator"><span /> Tersimpan di perangkat</span></div>
+          <div className="topbar-right"><span className={`save-indicator ${isDirty ? "save-indicator-dirty" : ""}`}><span /> {isDirty ? "Perubahan belum disimpan" : "Tersimpan di perangkat"}</span></div>
         </header>
 
         <div className="page-content">
@@ -319,9 +419,18 @@ function App() {
               <h1>Peta karakter <span>siswa</span></h1>
               <p>Kenali kekuatan, tumbuhkan potensi. Setiap anak punya cahaya yang bisa dibantu bersinar.</p>
             </div>
-            <button className="button button-secondary new-profile-button" type="button" onClick={startNewStudent}>
-              <Plus size={17} /> Profil baru
-            </button>
+            <div className="heading-actions">
+              <button className="button button-secondary backup-button" type="button" onClick={() => importFileRef.current?.click()}>
+                <Upload size={15} /> Pulihkan
+              </button>
+              <input ref={importFileRef} className="sr-only" type="file" accept="application/json,.json" onChange={importBackup} aria-label="Pilih file cadangan Pendar" />
+              <button className="button button-secondary backup-button" type="button" onClick={exportBackup}>
+                <Download size={15} /> Cadangkan
+              </button>
+              <button className="button button-secondary new-profile-button" type="button" onClick={startNewStudent}>
+                <Plus size={17} /> Profil baru
+              </button>
+            </div>
           </section>
 
           <form onSubmit={saveStudent}>
@@ -332,7 +441,7 @@ function App() {
                   <span>Nama siswa <span className="required-mark">*</span></span>
                   <input
                     value={form.name}
-                    onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+                    onChange={(event) => { setForm((current) => ({ ...current, name: event.target.value })); setIsDirty(true); }}
                     placeholder="Contoh: Alya Putri"
                     autoComplete="off"
                   />
@@ -341,7 +450,7 @@ function App() {
                   <span>Kelas <span className="required-mark">*</span></span>
                   <input
                     value={form.className}
-                    onChange={(event) => setForm((current) => ({ ...current, className: event.target.value }))}
+                    onChange={(event) => { setForm((current) => ({ ...current, className: event.target.value })); setIsDirty(true); }}
                     placeholder="Contoh: VII A"
                     autoComplete="off"
                   />
@@ -495,6 +604,9 @@ function App() {
               <div className={`form-notice ${notice ? "form-notice-visible" : ""}`} role="status" aria-live="polite">
                 {notice && <><CheckCircle2 size={16} /><span>{notice}</span></>}
               </div>
+              {currentId && <button className="button button-danger" type="button" onClick={deleteStudent}>
+                <Trash2 size={15} /> Hapus profil
+              </button>}
               <button className="button button-primary" type="submit">
                 <Save size={16} /> Simpan profil <ArrowRight size={16} />
               </button>
